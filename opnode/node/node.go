@@ -59,7 +59,7 @@ func New(ctx context.Context, cfg *Config, log log.Logger) (*OpNode, error) {
 
 	// TODO: we may need to authenticate the connection with L1
 	// l1Node.SetHeader()
-	l1Source := l1.NewSource(ethclient.NewClient(l1Node))
+	l1Source := l1.NewSource(l1Node, log)
 	var l2Engines []*driver.Driver
 	genesis := cfg.Rollup.Genesis
 
