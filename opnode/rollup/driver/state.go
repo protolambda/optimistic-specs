@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum-optimism/optimistic-specs/opnode/eth"
@@ -34,6 +35,8 @@ type state struct {
 
 	log  log.Logger
 	done chan struct{}
+
+	closed uint32 // non-zero when closed
 }
 
 func NewState(log log.Logger, config rollup.Config, l1 L1Chain, l2 L2Chain, output outputInterface, submitter BatchSubmitter, sequencer bool) *state {
@@ -138,6 +141,7 @@ func (s *state) loop() {
 		// case <-l1Poll.C:
 		// case <-l2Poll.C:
 		case <-s.done:
+			atomic.AddUint32(&s.closed, 1)
 			return
 		case <-l2BlockCreation:
 			// 1. Check if new epoch (new L1 head)
@@ -162,6 +166,9 @@ func (s *state) loop() {
 			// 4. Ask for batch submission
 			go func() {
 				_, err := s.bss.Submit(&s.Config, []*derive.BatchData{batch}) // TODO: submit multiple batches
+				if atomic.LoadUint32(&s.closed) > 0 {
+					return // closed, don't log (go-routine may be running after logger closed)
+				}
 				if err != nil {
 					s.log.Error("Error submitting batch", "err", err)
 				}
