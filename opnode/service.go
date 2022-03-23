@@ -41,6 +41,7 @@ func NewConfig(ctx *cli.Context) (*node.Config, error) {
 	cfg := &node.Config{
 		L1NodeAddr:       ctx.GlobalString(flags.L1NodeAddr.Name),
 		L2EngineAddrs:    ctx.GlobalStringSlice(flags.L2EngineAddrs.Name),
+		L1TrustRPC:       ctx.GlobalBool(flags.L1TrustRPC.Name),
 		Rollup:           *rollupConfig,
 		Sequencer:        enableSequencing,
 		SubmitterPrivKey: batchSubmitterKey,

@@ -19,7 +19,7 @@ type state struct {
 	l2SafeHead  eth.BlockID   // L2 Safe Head - this is the head of the L2 chain as derived from L1 (thus it is Sequencer window blocks behind)
 	l1Base      eth.BlockID   // L1 Parent of L2 Safe Head block
 	l2Finalized eth.BlockID   // L2 Block that will never be reversed
-	l1Window    []eth.BlockID // l1Window buffers the next L1 block IDs to derive new L2 blocks from, with increasing block height.
+	l1WindowBuf []eth.BlockID // l1WindowBuf buffers the next L1 block IDs to derive new L2 blocks from, with increasing block height.
 
 	// Rollup config
 	Config    rollup.Config
@@ -76,34 +76,35 @@ func (s *state) Close() error {
 	return nil
 }
 
-// l1WindowEnd returns the last block that should be used as `base` to L1ChainWindow.
+// l1WindowBufEnd returns the last block that should be used as `base` to L1ChainWindow.
 // This is either the last block of the window, or the L1 base block if the window is not populated.
-func (s *state) l1WindowEnd() eth.BlockID {
-	if len(s.l1Window) == 0 {
+func (s *state) l1WindowBufEnd() eth.BlockID {
+	if len(s.l1WindowBuf) == 0 {
 		return s.l1Base
 	}
-	return s.l1Window[len(s.l1Window)-1]
+	return s.l1WindowBuf[len(s.l1WindowBuf)-1]
 }
 
 // extendL1Window extends the cached L1 window by pulling blocks from L1.
-// It starts just after `s.l1WindowEnd()`.
+// It starts just after `s.l1WindowBufEnd()`.
 func (s *state) extendL1Window(ctx context.Context) error {
-	s.log.Trace("Extending the cached window from L1", "cached_size", len(s.l1Window), "window_end", s.l1WindowEnd())
-	nexts, err := s.l1.L1Range(ctx, s.l1WindowEnd())
+	s.log.Trace("Extending the cached window from L1", "cached_size", len(s.l1WindowBuf), "window_buf_end", s.l1WindowBufEnd())
+	// fetch enough ids for 2 sequencing windows (we'll shift from one into the other before we run out again)
+	nexts, err := s.l1.L1Range(ctx, s.l1WindowBufEnd(), s.Config.SeqWindowSize*2)
 	if err != nil {
 		return err
 	}
-	s.l1Window = append(s.l1Window, nexts...)
+	s.l1WindowBuf = append(s.l1WindowBuf, nexts...)
 	return nil
 }
 
 // sequencingWindow returns the next sequencing window and true if it exists, (nil, false) if
 // there are not enough saved blocks.
 func (s *state) sequencingWindow() ([]eth.BlockID, bool) {
-	if len(s.l1Window) < int(s.Config.SeqWindowSize) {
+	if len(s.l1WindowBuf) < int(s.Config.SeqWindowSize) {
 		return nil, false
 	}
-	return s.l1Window[:int(s.Config.SeqWindowSize)], true
+	return s.l1WindowBuf[:int(s.Config.SeqWindowSize)], true
 }
 
 func (s *state) loop() {
@@ -178,8 +179,8 @@ func (s *state) loop() {
 			if s.l1Head == newL1Head.Parent {
 				s.log.Trace("Linear extension")
 				s.l1Head = newL1Head.Self
-				if s.l1WindowEnd() == newL1Head.Parent {
-					s.l1Window = append(s.l1Window, newL1Head.Self)
+				if s.l1WindowBufEnd() == newL1Head.Parent {
+					s.l1WindowBuf = append(s.l1WindowBuf, newL1Head.Self)
 				}
 			} else {
 				s.log.Warn("L1 Head signal indicates an L1 re-org", "old_l1_head", s.l1Head, "new_l1_head_parent", newL1Head.Parent, "new_l1_head", newL1Head.Self)
@@ -196,7 +197,7 @@ func (s *state) loop() {
 				}
 				s.l1Head = newL1Head.Self
 				// TODO: Unsafe head here
-				s.l1Window = nil
+				s.l1WindowBuf = nil
 				s.l1Base = nextL2Head.L1Origin
 				s.l2SafeHead = nextL2Head.Self
 			}
@@ -211,10 +212,10 @@ func (s *state) loop() {
 			}
 			s.log.Trace("Got step request")
 			// Extend cached window if we do not have enough saved blocks
-			if len(s.l1Window) < int(s.Config.SeqWindowSize) {
+			if len(s.l1WindowBuf) < int(s.Config.SeqWindowSize) {
 				err := s.extendL1Window(context.Background())
 				if err != nil {
-					s.log.Error("Could not extend the cached L1 window", "err", err, "l1Head", s.l1Head, "l1Base", s.l1Base, "window_end", s.l1WindowEnd())
+					s.log.Error("Could not extend the cached L1 window", "err", err, "l1Head", s.l1Head, "l1Base", s.l1Base, "window_buf_end", s.l1WindowBufEnd())
 					continue
 				}
 			}
@@ -233,11 +234,11 @@ func (s *state) loop() {
 					s.l2Head = newL2Head
 				}
 				s.l2SafeHead = newL2Head
-				s.l1Base = s.l1Window[0]
-				s.l1Window = s.l1Window[1:]
+				s.l1Base = s.l1WindowBuf[0]
+				s.l1WindowBuf = s.l1WindowBuf[1:]
 				// TODO: l2Finalized
 			} else {
-				s.log.Trace("Not enough cached blocks to run step", "cached_window_len", len(s.l1Window))
+				s.log.Trace("Not enough cached blocks to run step", "cached_window_len", len(s.l1WindowBuf))
 			}
 
 			// Immediately run next step if we have enough blocks.

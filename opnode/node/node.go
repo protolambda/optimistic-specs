@@ -22,7 +22,7 @@ import (
 
 type OpNode struct {
 	log       log.Logger
-	l1Source  l1.Source        // Source to fetch data from (also implements the Downloader interface)
+	l1Source  *l1.Source       // Source to fetch data from (also implements the Downloader interface)
 	l2Engines []*driver.Driver // engines to keep synced
 	done      chan struct{}
 }
@@ -59,7 +59,7 @@ func New(ctx context.Context, cfg *Config, log log.Logger) (*OpNode, error) {
 
 	// TODO: we may need to authenticate the connection with L1
 	// l1Node.SetHeader()
-	l1Source := l1.NewSource(l1Node, log)
+	l1Source := l1.NewSource(l1Node, log, cfg.L1TrustRPC)
 	var l2Engines []*driver.Driver
 	genesis := cfg.Rollup.Genesis
 
@@ -84,7 +84,7 @@ func New(ctx context.Context, cfg *Config, log log.Logger) (*OpNode, error) {
 				PrivKey:   cfg.SubmitterPrivKey,
 			}
 		}
-		engine := driver.NewDriver(cfg.Rollup, client, &l1Source, log.New("engine", i, "Sequencer", cfg.Sequencer), submitter, cfg.Sequencer)
+		engine := driver.NewDriver(cfg.Rollup, client, l1Source, log.New("engine", i, "Sequencer", cfg.Sequencer), submitter, cfg.Sequencer)
 		l2Engines = append(l2Engines, engine)
 	}
 

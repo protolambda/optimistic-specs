@@ -4,29 +4,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rpc"
-	lru "github.com/hashicorp/golang-lru"
-	"math/big"
-
-	"github.com/ethereum/go-ethereum/trie"
 
 	"github.com/ethereum-optimism/optimistic-specs/opnode/eth"
 	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup/derive"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rpc"
+	lru "github.com/hashicorp/golang-lru"
 )
-
-const MaxBlocksInL1Range = uint64(100)
 
 type batchCallContextFn func(ctx context.Context, b []rpc.BatchElem) error
 
+type callContextFn func(ctx context.Context, result interface{}, method string, args ...interface{}) error
+
+// Source to retrieve L1 data from with optimized batch requests, cached results,
+// and flag to not trust the RPC.
 type Source struct {
-	client   *ethclient.Client
-	getBatch batchCallContextFn
-	log      log.Logger
+	client *ethclient.Client
+
+	batchCall batchCallContextFn
+	call      callContextFn
+
+	// If the RPC is untrusted, then we should not use cached information from responses,
+	// and instead verify against the block-hash.
+	// Of real L1 blocks no deposits can be missed/faked, no batches can be missed/faked,
+	// only the wrong L1 blocks can be retrieved.
+	trustCache bool
+
+	log log.Logger
 
 	// cache receipts in bundles per block hash
 	// common.Hash -> types.Receipts
@@ -36,118 +45,134 @@ type Source struct {
 	// common.Hash -> types.Transactions
 	transactionsCache *lru.Cache
 
-	// cache blocks of blocks by hash
-	// common.Hash -> *types.Block
-	blocksCache *lru.Cache
-
-	// TODO: do we even want to cache blocks by number? Or too fragile to reorgs?
-
-	// cache headers by block hash
+	// cache block headers of blocks by hash
+	// common.Hash -> *HeaderInfo
 	headersCache *lru.Cache
 }
 
-func NewSource(client *rpc.Client, log log.Logger) Source {
+func NewSource(client *rpc.Client, log log.Logger, trustRPC bool) *Source {
 	// TODO: tune cache sizes
 	receiptsCache, _ := lru.New(5000)
 	transactionsCache, _ := lru.New(200)
-	blocksCache, _ := lru.New(200)
 	headersCache, _ := lru.New(200)
 
-	return Source{
+	return &Source{
 		client:            ethclient.NewClient(client),
-		getBatch:          client.BatchCallContext,
+		batchCall:         client.BatchCallContext,
+		call:              client.CallContext,
 		log:               log,
 		receiptsCache:     receiptsCache,
 		transactionsCache: transactionsCache,
-		blocksCache:       blocksCache,
 		headersCache:      headersCache,
+		trustCache:        trustRPC,
 	}
 }
 
+// SubscribeNewHead subscribes to notifications about the current blockchain head on the given channel.
 func (s *Source) SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (ethereum.Subscription, error) {
+	// Note that *types.Header does not cache the block hash unlike *HeaderInfo, it always recomputes.
+	// Inefficient if used poorly, but no trust issue.
 	return s.client.SubscribeNewHead(ctx, ch)
 }
 
-func (s *Source) HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error) {
-	if header, ok := s.headersCache.Get(hash); ok {
-		return header.(*types.Header), nil
-	}
-	header, err := s.client.HeaderByHash(ctx, hash)
-	if err == nil {
-		s.headersCache.Add(hash, header)
-	}
-	return header, err
-}
-
-func (s *Source) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
-	// TODO: do we need to cache this? It's small and may suddenly change if the number is recent.
-	// And number==nil (head) cannot be cached.
-	return s.client.HeaderByNumber(ctx, number)
-}
-
-func (s *Source) BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error) {
-	if block, ok := s.blocksCache.Get(hash); ok {
-		return block.(*types.Block), nil
-	}
-	block, err := s.client.BlockByHash(ctx, hash)
-	if err == nil {
-		s.blocksCache.Add(hash, block)
-	}
-	return block, err
-}
-
-func (s *Source) BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error) {
-	return s.client.BlockByNumber(ctx, number)
-}
-
-func (s *Source) Close() {
-	s.client.Close()
-}
-
-func (s *Source) FetchL1Info(ctx context.Context, id eth.BlockID) (derive.L1Info, error) {
-	return s.BlockByHash(ctx, id.Hash)
-}
-
-func (s *Source) Fetch(ctx context.Context, id eth.BlockID) (*types.Block, []*types.Receipt, error) {
-	block, err := s.BlockByHash(ctx, id.Hash)
-	if err != nil {
-		return nil, nil, err
-	}
-	if receipts, ok := s.receiptsCache.Get(id.Hash); ok {
-		return block, receipts.(types.Receipts), nil
-	}
-	receipts, err := fetchReceipts(ctx, s.log, block, s.getBatch)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.receiptsCache.Add(id.Hash, receipts)
-	return block, receipts, nil
-}
-
-func (s *Source) FetchReceipts(ctx context.Context, id eth.BlockID) ([]*types.Receipt, error) {
-	_, receipts, err := s.Fetch(ctx, id)
+func (s *Source) headerCall(ctx context.Context, method string, id interface{}) (*HeaderInfo, error) {
+	var header *rpcHeader
+	err := s.call(ctx, &header, method, id, false) // headers are just blocks without txs
 	if err != nil {
 		return nil, err
 	}
-	// Sanity-check: external L1-RPC sources are notorious for not returning all receipts,
-	// or returning them out-of-order. Verify the receipts against the expected receipt-hash.
-	hasher := trie.NewStackTrie(nil)
-	computed := types.DeriveSha(types.Receipts(receipts), hasher)
-	if receiptHash != computed {
-		return nil, fmt.Errorf("failed to validate receipts of %s, computed receipt-hash %s does not match expected hash %d", id, computed, receiptHash)
+	if header == nil {
+		return nil, ethereum.NotFound
 	}
-	return receipts, nil
+	info, err := header.Info(s.trustCache)
+	if err != nil {
+		return nil, err
+	}
+	s.headersCache.Add(info.hash, info)
+	return info, nil
 }
 
-// FetchAllTransactions fetches transaction lists of a window of blocks, and caches each transaction list per block.
+func (s *Source) blockCall(ctx context.Context, method string, id interface{}) (*HeaderInfo, types.Transactions, error) {
+	var block *rpcBlock
+	err := s.call(ctx, &block, method, id, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if block == nil {
+		return nil, nil, ethereum.NotFound
+	}
+	info, txs, err := block.Info(s.trustCache)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.headersCache.Add(info.hash, info)
+	s.transactionsCache.Add(info.hash, txs)
+	return info, txs, nil
+}
+
+func (s *Source) InfoByHash(ctx context.Context, hash common.Hash) (derive.L1Info, error) {
+	if header, ok := s.headersCache.Get(hash); ok {
+		return header.(*HeaderInfo), nil
+	}
+	return s.headerCall(ctx, "eth_getBlockByHash", hash)
+}
+
+func (s *Source) InfoByNumber(ctx context.Context, number uint64) (derive.L1Info, error) {
+	// can't hit the cache when querying by number due to reorgs.
+	return s.headerCall(ctx, "eth_getBlockByNumber", hexutil.EncodeUint64(number))
+}
+
+func (s *Source) InfoHead(ctx context.Context) (derive.L1Info, error) {
+	// can't hit the cache when querying the head due to reorgs / changes.
+	return s.headerCall(ctx, "eth_getBlockByNumber", "latest")
+}
+
+func (s *Source) InfoAndTxsByHash(ctx context.Context, hash common.Hash) (derive.L1Info, types.Transactions, error) {
+	if header, ok := s.headersCache.Get(hash); ok {
+		if txs, ok := s.transactionsCache.Get(hash); ok {
+			return header.(*HeaderInfo), txs.(types.Transactions), nil
+		}
+	}
+	return s.blockCall(ctx, "eth_getBlockByHash", hash)
+}
+
+func (s *Source) InfoAndTxsByNumber(ctx context.Context, number uint64) (derive.L1Info, types.Transactions, error) {
+	// can't hit the cache when querying by number due to reorgs.
+	return s.blockCall(ctx, "eth_getBlockByNumber", hexutil.EncodeUint64(number))
+}
+
+func (s *Source) InfoAndTxsHead(ctx context.Context) (derive.L1Info, types.Transactions, error) {
+	// can't hit the cache when querying the head due to reorgs / changes.
+	return s.blockCall(ctx, "eth_getBlockByNumber", "latest")
+}
+
+func (s *Source) Fetch(ctx context.Context, blockHash common.Hash) (derive.L1Info, types.Transactions, types.Receipts, error) {
+	if blockHash == (common.Hash{}) {
+		return nil, nil, nil, ethereum.NotFound
+	}
+	info, txs, err := s.blockCall(ctx, "eth_getBlockByHash", blockHash)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	receipts, err := fetchReceipts(ctx, s.log, info.receiptHash, txs, s.batchCall)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	s.receiptsCache.Add(info.hash, receipts)
+	return info, txs, receipts, nil
+}
+
+// FetchAllTransactions fetches transaction lists of a window of blocks, and caches each block and the transactions
 func (s *Source) FetchAllTransactions(ctx context.Context, window []eth.BlockID) ([]types.Transactions, error) {
 	// list of transaction lists
 	allTxLists := make([]types.Transactions, len(window))
 
-	blockRequests := make([]rpc.BatchElem, 0)
-	requestIndices := make([]int, 0)
+	var blockRequests []rpc.BatchElem
+	var requestIndices []int
 
 	for i := 0; i < len(window); i++ {
+		// if we are shifting the window by 1 block at a time, most of the results should already be in the cache.
 		txs, ok := s.transactionsCache.Get(window[i].Hash)
 		if ok {
 			allTxLists[i] = txs.(types.Transactions)
@@ -158,104 +183,110 @@ func (s *Source) FetchAllTransactions(ctx context.Context, window []eth.BlockID)
 				Result: new(rpcBlock),
 				Error:  nil,
 			})
-			requestIndices = append(requestIndices, i)
+			requestIndices = append(requestIndices, i) // remember the block index this request corresponds to
 		}
 	}
-	if err := s.getBatch(ctx, blockRequests); err != nil {
+	if err := s.batchCall(ctx, blockRequests); err != nil {
 		return nil, err
 	}
 
 	// try to cache everything we have before halting on the results with errors
 	for i := 0; i < len(blockRequests); i++ {
 		if blockRequests[i].Error == nil {
-			txs := blockRequests[i].Result.(*rpcBlock).Txs()
+			info, txs, err := blockRequests[i].Result.(*rpcBlock).Info(s.trustCache)
+			if err != nil {
+				return nil, fmt.Errorf("bad block data for block %s: %v", blockRequests[i].Args[0], err)
+			}
+			s.headersCache.Add(info.hash, info)
+			s.transactionsCache.Add(info.hash, txs)
 			allTxLists[requestIndices[i]] = txs
-			// cache the transactions
-			s.transactionsCache.Add(blockRequests[i].Args[0], txs)
 		}
 	}
 
-	for i := 0; i < len(window); i++ {
+	for i := 0; i < len(blockRequests); i++ {
 		if blockRequests[i].Error != nil {
-			return nil, fmt.Errorf("failed to retrieve transactions of block %s in batch of %d blocks: %v", blockRequests[i].Args[0], len(blockRequests), blockRequests[i].Error)
+			return nil, fmt.Errorf("failed to retrieve transactions of block %s in batch of %d blocks: %v", window[i], len(blockRequests), blockRequests[i].Error)
 		}
 	}
 
 	return allTxLists, nil
 }
 
+func (s *Source) refFromStart(ctx context.Context, info derive.L1Info) (eth.L1BlockRef, error) {
+	if info.NumberU64() == 0 {
+		return eth.L1BlockRef{Self: info.ID()}, nil // L1 genesis block has zeroed parent hash / number
+	}
+	parent, err := s.InfoByHash(ctx, info.ParentHash())
+	if err != nil {
+		return eth.L1BlockRef{}, fmt.Errorf("failed to fetch parent of %s: %v", info.ID(), err)
+	}
+	return eth.L1BlockRef{Self: info.ID(), Parent: parent.ID()}, nil
+}
+
 func (s *Source) L1HeadBlockRef(ctx context.Context) (eth.L1BlockRef, error) {
-	return s.l1BlockRefByNumber(ctx, nil)
+	head, err := s.InfoHead(ctx)
+	if err != nil {
+		return eth.L1BlockRef{}, fmt.Errorf("failed to fetch head header: %v", err)
+	}
+	return s.refFromStart(ctx, head)
 }
 
 func (s *Source) L1BlockRefByNumber(ctx context.Context, l1Num uint64) (eth.L1BlockRef, error) {
-	return s.l1BlockRefByNumber(ctx, new(big.Int).SetUint64(l1Num))
+	head, err := s.InfoByNumber(ctx, l1Num)
+	if err != nil {
+		return eth.L1BlockRef{}, fmt.Errorf("failed to fetch header by num %d: %v", l1Num, err)
+	}
+	return s.refFromStart(ctx, head)
 }
 
-// l1BlockRefByNumber wraps l1.HeaderByNumber to return an eth.L1BlockRef
-// This is internal because the exposed L1BlockRefByNumber takes uint64 instead of big.Ints
-func (s *Source) l1BlockRefByNumber(ctx context.Context, number *big.Int) (eth.L1BlockRef, error) {
-	header, err := s.HeaderByNumber(ctx, number)
-	if err != nil {
-		// w%: wrap the error, we still need to detect if a canonical block is not found, a.k.a. end of chain.
-		return eth.L1BlockRef{}, fmt.Errorf("failed to determine block-hash of height %v, could not get header: %w", number, err)
+// L1Range returns a range of L1 block beginning just after begin, up to max blocks.
+// This batch-requests all blocks by number in the range at once, and then verifies the consistency
+func (s *Source) L1Range(ctx context.Context, begin eth.BlockID, max uint64) ([]eth.BlockID, error) {
+
+	headerRequests := make([]rpc.BatchElem, max)
+	for i := uint64(0); i < max; i++ {
+		headerRequests[i] = rpc.BatchElem{
+			Method: "eth_getBlockByNumber",
+			Args:   []interface{}{hexutil.EncodeUint64(begin.Number + 1 + i), false},
+			Result: new(*rpcHeader),
+			Error:  nil,
+		}
 	}
-	l1Num := header.Number.Uint64()
-	parentNum := l1Num
-	if parentNum > 0 {
-		parentNum -= 1
+	if err := s.batchCall(ctx, headerRequests); err != nil {
+		return nil, err
 	}
-	return eth.L1BlockRef{
-		Self:   eth.BlockID{Hash: header.Hash(), Number: l1Num},
-		Parent: eth.BlockID{Hash: header.ParentHash, Number: parentNum},
-	}, nil
+
+	out := make([]eth.BlockID, 0, max)
+
+	// try to cache everything we have before halting on the results with errors
+	for i := 0; i < len(headerRequests); i++ {
+		result := *headerRequests[i].Result.(**rpcHeader)
+		if headerRequests[i].Error == nil {
+			if result == nil {
+				break // no more headers from here
+			}
+			info, err := result.Info(s.trustCache)
+			if err != nil {
+				return nil, fmt.Errorf("bad header data for block %s: %v", headerRequests[i].Args[0], err)
+			}
+			s.headersCache.Add(info.hash, info)
+			out = append(out, info.ID())
+			prev := begin
+			if i > 0 {
+				prev = out[i-1]
+			}
+			if prev.Hash != info.parentHash {
+				return nil, fmt.Errorf("inconsistent results from L1 chain range request, block %s not expected parent %s of %s", prev, info.parentHash, info.ID())
+			}
+		} else if errors.Is(headerRequests[i].Error, ethereum.NotFound) {
+			break // no more headers from here
+		} else {
+			return nil, fmt.Errorf("failed to retrieve block: %s: %v", headerRequests[i].Args[0], headerRequests[i].Error)
+		}
+	}
+	return out, nil
 }
 
-// L1Range returns a range of L1 block beginning just after `begin`.
-func (s *Source) L1Range(ctx context.Context, begin eth.BlockID) ([]eth.BlockID, error) {
-
-	// TODO: batch-request
-	// TODO: check if a soft API, where we return less if there are errors can work
-	// TODO: preseve parent-hash chain checks, blocks need to be chained
-
-	// Ensure that we start on the expected chain.
-	if canonicalBegin, err := s.L1BlockRefByNumber(ctx, begin.Number); err != nil {
-		return nil, fmt.Errorf("failed to fetch L1 block %v %v: %w", begin.Number, begin.Hash, err)
-	} else {
-		if canonicalBegin.Self != begin {
-			return nil, fmt.Errorf("Re-org at begin block. Expected: %v. Actual: %v", begin, canonicalBegin.Self)
-		}
-	}
-
-	l1head, err := s.L1HeadBlockRef(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch head L1 block: %w", err)
-	}
-	maxBlocks := MaxBlocksInL1Range
-	// Cap maxBlocks if there are less than maxBlocks between `begin` and the head of the chain.
-	if l1head.Self.Number-begin.Number <= maxBlocks {
-		maxBlocks = l1head.Self.Number - begin.Number
-	}
-
-	if maxBlocks == 0 {
-		return nil, nil
-	}
-
-	prevHash := begin.Hash
-	var res []eth.BlockID
-	// TODO: Walk backwards to be able to use block by hash
-	for i := begin.Number + 1; i < begin.Number+maxBlocks+1; i++ {
-		n, err := s.L1BlockRefByNumber(ctx, i)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch L1 block %v: %w", i, err)
-		}
-		// TODO(Joshua): Look into why this fails around the genesis block
-		if n.Parent.Number != 0 && n.Parent.Hash != prevHash {
-			return nil, errors.New("re-organization occurred while attempting to get l1 range")
-		}
-		prevHash = n.Self.Hash
-		res = append(res, n.Self)
-	}
-
-	return res, nil
+func (s *Source) Close() {
+	s.client.Close()
 }

@@ -3,19 +3,23 @@ package l1
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
-	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
 const MaxReceiptRetry = 3
 
-func fetchReceipts(ctx context.Context, log log.Logger, block *types.Block, getBatch batchCallContextFn) (types.Receipts, error) {
-	txs := block.Transactions()
+func fetchReceipts(ctx context.Context, log log.Logger, receiptHash common.Hash, txs types.Transactions, getBatch batchCallContextFn) (types.Receipts, error) {
 	if len(txs) == 0 {
+		if receiptHash != types.EmptyRootHash {
+			return nil, fmt.Errorf("no transactions, but got non-empty receipt trie root: %s", receiptHash)
+		}
 		return nil, nil
 	}
 
@@ -74,8 +78,8 @@ func fetchReceipts(ctx context.Context, log log.Logger, block *types.Block, getB
 	// or returning them out-of-order. Verify the receipts against the expected receipt-hash.
 	hasher := trie.NewStackTrie(nil)
 	computed := types.DeriveSha(types.Receipts(receipts), hasher)
-	if expected := block.ReceiptHash(); expected != computed {
-		return nil, fmt.Errorf("failed to fetch list of receipts: expected receipt root %s but retrieved %s", expected, computed)
+	if receiptHash != computed {
+		return nil, fmt.Errorf("failed to fetch list of receipts: expected receipt root %s but computed %s from retrieved receipts", receiptHash, computed)
 	}
 	return receipts, nil
 }

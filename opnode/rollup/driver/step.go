@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
+
 	"github.com/ethereum-optimism/optimistic-specs/opnode/eth"
 	"github.com/ethereum-optimism/optimistic-specs/opnode/l2"
 	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup"
 	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup/derive"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -31,7 +32,14 @@ func (d *outputImpl) newBlock(ctx context.Context, l2Finalized eth.BlockID, l2Pa
 	if err != nil {
 		return l2Parent, nil, fmt.Errorf("failed to fetch L2 block info of %s: %v", l2Parent, err)
 	}
-	l1Info, err := d.dl.FetchL1Info(fetchCtx, l1Origin)
+	var l1Info derive.L1Info
+	var receipts types.Receipts
+	if includeDeposits {
+		l1Info, _, receipts, err = d.dl.Fetch(fetchCtx, l1Origin.Hash)
+	} else {
+		l1Info, err = d.dl.InfoByHash(fetchCtx, l1Origin.Hash)
+		// don't fetch receipts if we do not process deposits
+	}
 	if err != nil {
 		return l2Parent, nil, fmt.Errorf("failed to fetch L1 block info of %s: %v", l1Origin, err)
 	}
@@ -41,13 +49,6 @@ func (d *outputImpl) newBlock(ctx context.Context, l2Finalized eth.BlockID, l2Pa
 		return l2Parent, nil, errors.New("L2 Timestamp is too large")
 	}
 
-	var receipts types.Receipts
-	if includeDeposits {
-		receipts, err = d.dl.FetchReceipts(fetchCtx, l1Origin, l1Info.ReceiptHash())
-		if err != nil {
-			return l2Parent, nil, fmt.Errorf("failed to fetch receipts of %s: %v", l1Origin, err)
-		}
-	}
 	l1InfoTx, err := derive.L1InfoDepositBytes(l1Info)
 	if err != nil {
 		return l2Parent, nil, err
@@ -115,24 +116,20 @@ func (d *outputImpl) step(ctx context.Context, l2Head eth.BlockID, l2Finalized e
 	if err != nil {
 		return l2Head, fmt.Errorf("failed to fetch L2 block info of %s: %w", l2Head, err)
 	}
-	l1Info, err := d.dl.FetchL1Info(fetchCtx, l1Input[0])
+	l1Info, _, receipts, err := d.dl.Fetch(fetchCtx, l1Input[0].Hash)
 	if err != nil {
-		return l2Head, fmt.Errorf("failed to fetch L1 block info of %s: %w", l1Input[0], err)
+		return l2Head, fmt.Errorf("failed to fetch L1 block with receipts %s: %w", l1Input[0], err)
 	}
 	l1InfoTx, err := derive.L1InfoDepositBytes(l1Info)
 	if err != nil {
 		return l2Head, fmt.Errorf("failed to create l1InfoTx: %w", err)
-	}
-	receipts, err := d.dl.FetchReceipts(fetchCtx, l1Input[0], l1Info.ReceiptHash())
-	if err != nil {
-		return l2Head, fmt.Errorf("failed to fetch receipts of %s: %w", l1Input[0], err)
 	}
 	deposits, err := derive.DeriveDeposits(l2Head.Number+1, receipts)
 	if err != nil {
 		return l2Head, fmt.Errorf("failed to derive deposits: %w", err)
 	}
 	// TODO: with sharding the blobs may be identified in more detail than L1 block hashes
-	transactions, err := d.dl.FetchTransactions(fetchCtx, l1Input)
+	transactions, err := d.dl.FetchAllTransactions(fetchCtx, l1Input)
 	if err != nil {
 		return l2Head, fmt.Errorf("failed to fetch transactions from %s: %v", l1Input, err)
 	}
