@@ -9,16 +9,17 @@ import (
 	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup/derive"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/trie"
 )
 
 // Note: we do this ugly typing because we want the best, and the standard bindings are not sufficient:
 // - batched calls of many block requests (standard bindings do extra uncle-header fetches, cannot be batched nicely)
 // - ignore uncle data (does not even exist anymore post-Merge)
-// - use cached transaction-sender data, if we trust the RPC.
 // - use cached block hash, if we trust the RPC.
 // - verify transactions list matches tx-root, to ensure consistency with block-hash, if we do not trust the RPC
+//
+// Transaction-sender data from the RPC is not cached, since ethclient.setSenderFromServer is private,
+// and we only need to compute the sender for transactions into the inbox.
 //
 // This way we minimize RPC calls, enable batching, and can choose to verify what the RPC gives us.
 
@@ -105,7 +106,7 @@ func (header *rpcHeader) Info(trustCache bool) (*HeaderInfo, error) {
 }
 
 type rpcBlockCacheInfo struct {
-	Transactions []rpcTransaction `json:"transactions"`
+	Transactions []*types.Transaction `json:"transactions"`
 }
 
 type rpcBlock struct {
@@ -127,37 +128,12 @@ func (block *rpcBlock) Info(trustCache bool) (*HeaderInfo, types.Transactions, e
 		return nil, nil, fmt.Errorf("failed to verify block from RPC: %v", err)
 	}
 
-	txs := make([]*types.Transaction, len(block.cache.Transactions))
-	for i := 0; i < len(block.cache.Transactions); i++ {
-		tx := block.cache.Transactions[i]
-		if trustCache && tx.cache.From != nil { // cache the sender (lazily compute it later if we don't trust the RPC)
-			ethclient.SetSenderFromServer(tx.tx, *tx.cache.From, info.hash)
-		}
-		txs[i] = tx.tx
-	}
 	if !trustCache { // verify the list of transactions matches the tx-root
 		hasher := trie.NewStackTrie(nil)
-		computed := types.DeriveSha(types.Transactions(txs), hasher)
+		computed := types.DeriveSha(types.Transactions(block.cache.Transactions), hasher)
 		if expected := info.txHash; expected != computed {
 			return nil, nil, fmt.Errorf("failed to verify transactions list: expected transactions root %s but retrieved %s", expected, computed)
 		}
 	}
-	return info, txs, nil
-}
-
-type rpcTransactionCacheInfo struct {
-	// just ignore blockNumber and blockHash extra data
-	From *common.Address `json:"from,omitempty"`
-}
-
-type rpcTransaction struct {
-	tx    *types.Transaction
-	cache rpcTransactionCacheInfo
-}
-
-func (tx *rpcTransaction) UnmarshalJSON(msg []byte) error {
-	if err := json.Unmarshal(msg, &tx.tx); err != nil {
-		return err
-	}
-	return json.Unmarshal(msg, &tx.cache)
+	return info, block.cache.Transactions, nil
 }

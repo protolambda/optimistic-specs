@@ -180,7 +180,7 @@ func BatchesFromEVMTransactions(config *rollup.Config, txLists []types.Transacti
 	for _, txs := range txLists {
 		for _, tx := range txs {
 			if to := tx.To(); to != nil && *to == config.BatchInboxAddress {
-				seqDataSubmitter, err := l1Signer.Sender(tx)
+				seqDataSubmitter, err := l1Signer.Sender(tx) // optimization: only derive sender if To is correct
 				if err != nil {
 					// TODO: log error
 					continue // bad signature, ignore

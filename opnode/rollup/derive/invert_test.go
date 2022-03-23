@@ -1,10 +1,11 @@
 package derive
 
 import (
-	"github.com/ethereum/go-ethereum/core/types"
 	"math/big"
 	"math/rand"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/ethereum-optimism/optimistic-specs/opnode/eth"
 
