@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup"
+
 	"github.com/ethereum-optimism/optimistic-specs/opnode/eth"
 	"github.com/ethereum-optimism/optimistic-specs/opnode/rollup/derive"
 	"github.com/ethereum/go-ethereum"
@@ -16,6 +18,48 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
 )
+
+type SourceConfig struct {
+	MaxParallelBatching int
+	MaxBatchRetry       int
+	MaxRequestsPerBatch int
+
+	// cache sizes
+
+	// Number of blocks worth of receipts to cache
+	ReceiptsCacheSize int
+	// Number of blocks worth of transactions to cache
+	TransactionsCacheSize int
+	// Number of
+	HeadersCacheSize int
+
+	// If the RPC is untrusted, then we should not use cached information from responses,
+	// and instead verify against the block-hash.
+	// Of real L1 blocks no deposits can be missed/faked, no batches can be missed/faked,
+	// only the wrong L1 blocks can be retrieved.
+	TrustRPC bool
+}
+
+func DefaultConfig(config *rollup.Config, trustRPC bool) SourceConfig {
+	return SourceConfig{
+		// We only consume receipts once per block,
+		// we just need basic redundancy if we share the cache between multiple drivers
+		ReceiptsCacheSize: 20,
+
+		// Optimal if at least a few times the size of a sequencing window.
+		// When smaller than a window, requests would be repeated every window shift.
+		// Additional cache-size for handling reorgs, and thus more unique blocks, also helps.
+		TransactionsCacheSize: int(config.SeqWindowSize * 4),
+		HeadersCacheSize:      int(config.SeqWindowSize * 4),
+
+		// TODO: tune batch params
+		MaxParallelBatching: 8,
+		MaxBatchRetry:       3,
+		MaxRequestsPerBatch: 20,
+
+		TrustRPC: trustRPC,
+	}
+}
 
 type batchCallContextFn func(ctx context.Context, b []rpc.BatchElem) error
 
@@ -29,13 +73,7 @@ type Source struct {
 	batchCall batchCallContextFn
 	call      callContextFn
 
-	// If the RPC is untrusted, then we should not use cached information from responses,
-	// and instead verify against the block-hash.
-	// Of real L1 blocks no deposits can be missed/faked, no batches can be missed/faked,
-	// only the wrong L1 blocks can be retrieved.
-	trustCache bool
-
-	log log.Logger
+	trustRPC bool
 
 	// cache receipts in bundles per block hash
 	// common.Hash -> types.Receipts
@@ -50,21 +88,24 @@ type Source struct {
 	headersCache *lru.Cache
 }
 
-func NewSource(client *rpc.Client, log log.Logger, trustRPC bool) *Source {
-	// TODO: tune cache sizes
-	receiptsCache, _ := lru.New(5000)
-	transactionsCache, _ := lru.New(200)
-	headersCache, _ := lru.New(200)
+func NewSource(client *rpc.Client, log log.Logger, config SourceConfig) *Source {
+	receiptsCache, _ := lru.New(config.ReceiptsCacheSize)
+	transactionsCache, _ := lru.New(config.TransactionsCacheSize)
+	headersCache, _ := lru.New(config.HeadersCacheSize)
+
+	// Batch calls will be split up to handle max-batch size,
+	// and parallelized since the RPC server does not parallelize batch contents otherwise.
+	getBatch := parallelBatchCall(log, client.BatchCallContext,
+		config.MaxBatchRetry, config.MaxRequestsPerBatch, config.MaxParallelBatching)
 
 	return &Source{
 		client:            ethclient.NewClient(client),
-		batchCall:         client.BatchCallContext,
+		batchCall:         getBatch,
 		call:              client.CallContext,
-		log:               log,
+		trustRPC:          config.TrustRPC,
 		receiptsCache:     receiptsCache,
 		transactionsCache: transactionsCache,
 		headersCache:      headersCache,
-		trustCache:        trustRPC,
 	}
 }
 
@@ -84,7 +125,7 @@ func (s *Source) headerCall(ctx context.Context, method string, id interface{}) 
 	if header == nil {
 		return nil, ethereum.NotFound
 	}
-	info, err := header.Info(s.trustCache)
+	info, err := header.Info(s.trustRPC)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +142,7 @@ func (s *Source) blockCall(ctx context.Context, method string, id interface{}) (
 	if block == nil {
 		return nil, nil, ethereum.NotFound
 	}
-	info, txs, err := block.Info(s.trustCache)
+	info, txs, err := block.Info(s.trustRPC)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -155,7 +196,7 @@ func (s *Source) Fetch(ctx context.Context, blockHash common.Hash) (derive.L1Inf
 		return nil, nil, nil, err
 	}
 
-	receipts, err := fetchReceipts(ctx, s.log, info.receiptHash, txs, s.batchCall)
+	receipts, err := fetchReceipts(ctx, info.receiptHash, txs, s.batchCall)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -186,6 +227,7 @@ func (s *Source) FetchAllTransactions(ctx context.Context, window []eth.BlockID)
 			requestIndices = append(requestIndices, i) // remember the block index this request corresponds to
 		}
 	}
+
 	if err := s.batchCall(ctx, blockRequests); err != nil {
 		return nil, err
 	}
@@ -193,7 +235,7 @@ func (s *Source) FetchAllTransactions(ctx context.Context, window []eth.BlockID)
 	// try to cache everything we have before halting on the results with errors
 	for i := 0; i < len(blockRequests); i++ {
 		if blockRequests[i].Error == nil {
-			info, txs, err := blockRequests[i].Result.(*rpcBlock).Info(s.trustCache)
+			info, txs, err := blockRequests[i].Result.(*rpcBlock).Info(s.trustRPC)
 			if err != nil {
 				return nil, fmt.Errorf("bad block data for block %s: %v", blockRequests[i].Args[0], err)
 			}
@@ -265,7 +307,7 @@ func (s *Source) L1Range(ctx context.Context, begin eth.BlockID, max uint64) ([]
 			if result == nil {
 				break // no more headers from here
 			}
-			info, err := result.Info(s.trustCache)
+			info, err := result.Info(s.trustRPC)
 			if err != nil {
 				return nil, fmt.Errorf("bad header data for block %s: %v", headerRequests[i].Args[0], err)
 			}
