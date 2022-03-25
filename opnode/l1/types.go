@@ -111,14 +111,14 @@ type rpcBlockCacheInfo struct {
 
 type rpcBlock struct {
 	header rpcHeader
-	cache  rpcBlockCacheInfo
+	extra  rpcBlockCacheInfo
 }
 
 func (block *rpcBlock) UnmarshalJSON(msg []byte) error {
 	if err := json.Unmarshal(msg, &block.header); err != nil {
 		return err
 	}
-	return json.Unmarshal(msg, &block.cache)
+	return json.Unmarshal(msg, &block.extra)
 }
 
 func (block *rpcBlock) Info(trustCache bool) (*HeaderInfo, types.Transactions, error) {
@@ -130,10 +130,10 @@ func (block *rpcBlock) Info(trustCache bool) (*HeaderInfo, types.Transactions, e
 
 	if !trustCache { // verify the list of transactions matches the tx-root
 		hasher := trie.NewStackTrie(nil)
-		computed := types.DeriveSha(types.Transactions(block.cache.Transactions), hasher)
+		computed := types.DeriveSha(types.Transactions(block.extra.Transactions), hasher)
 		if expected := info.txHash; expected != computed {
 			return nil, nil, fmt.Errorf("failed to verify transactions list: expected transactions root %s but retrieved %s", expected, computed)
 		}
 	}
-	return info, block.cache.Transactions, nil
+	return info, block.extra.Transactions, nil
 }

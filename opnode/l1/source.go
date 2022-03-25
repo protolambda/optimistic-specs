@@ -13,7 +13,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
@@ -63,15 +62,19 @@ func DefaultConfig(config *rollup.Config, trustRPC bool) SourceConfig {
 
 type batchCallContextFn func(ctx context.Context, b []rpc.BatchElem) error
 
-type callContextFn func(ctx context.Context, result interface{}, method string, args ...interface{}) error
+type RPCClient interface {
+	BatchCallContext(ctx context.Context, b []rpc.BatchElem) error
+	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
+	EthSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*rpc.ClientSubscription, error)
+	Close()
+}
 
 // Source to retrieve L1 data from with optimized batch requests, cached results,
 // and flag to not trust the RPC.
 type Source struct {
-	client *ethclient.Client
+	client RPCClient
 
 	batchCall batchCallContextFn
-	call      callContextFn
 
 	trustRPC bool
 
@@ -88,7 +91,7 @@ type Source struct {
 	headersCache *lru.Cache
 }
 
-func NewSource(client *rpc.Client, log log.Logger, config SourceConfig) *Source {
+func NewSource(client RPCClient, log log.Logger, config SourceConfig) *Source {
 	receiptsCache, _ := lru.New(config.ReceiptsCacheSize)
 	transactionsCache, _ := lru.New(config.TransactionsCacheSize)
 	headersCache, _ := lru.New(config.HeadersCacheSize)
@@ -99,9 +102,8 @@ func NewSource(client *rpc.Client, log log.Logger, config SourceConfig) *Source 
 		config.MaxBatchRetry, config.MaxRequestsPerBatch, config.MaxParallelBatching)
 
 	return &Source{
-		client:            ethclient.NewClient(client),
+		client:            client,
 		batchCall:         getBatch,
-		call:              client.CallContext,
 		trustRPC:          config.TrustRPC,
 		receiptsCache:     receiptsCache,
 		transactionsCache: transactionsCache,
@@ -113,12 +115,12 @@ func NewSource(client *rpc.Client, log log.Logger, config SourceConfig) *Source 
 func (s *Source) SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (ethereum.Subscription, error) {
 	// Note that *types.Header does not cache the block hash unlike *HeaderInfo, it always recomputes.
 	// Inefficient if used poorly, but no trust issue.
-	return s.client.SubscribeNewHead(ctx, ch)
+	return s.client.EthSubscribe(ctx, ch, "newHeads")
 }
 
 func (s *Source) headerCall(ctx context.Context, method string, id interface{}) (*HeaderInfo, error) {
 	var header *rpcHeader
-	err := s.call(ctx, &header, method, id, false) // headers are just blocks without txs
+	err := s.client.CallContext(ctx, &header, method, id, false) // headers are just blocks without txs
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +137,7 @@ func (s *Source) headerCall(ctx context.Context, method string, id interface{}) 
 
 func (s *Source) blockCall(ctx context.Context, method string, id interface{}) (*HeaderInfo, types.Transactions, error) {
 	var block *rpcBlock
-	err := s.call(ctx, &block, method, id, true)
+	err := s.client.CallContext(ctx, &block, method, id, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -228,8 +230,10 @@ func (s *Source) FetchAllTransactions(ctx context.Context, window []eth.BlockID)
 		}
 	}
 
-	if err := s.batchCall(ctx, blockRequests); err != nil {
-		return nil, err
+	if len(blockRequests) > 0 {
+		if err := s.batchCall(ctx, blockRequests); err != nil {
+			return nil, err
+		}
 	}
 
 	// try to cache everything we have before halting on the results with errors
