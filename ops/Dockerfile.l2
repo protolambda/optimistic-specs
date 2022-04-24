@@ -1,8 +1,10 @@
-FROM ethereumoptimism/reference-optimistic-geth:latest
+FROM opti-erigon:latest
 
-RUN apk add --no-cache jq
+# FROM ethereumoptimism/reference-optimistic-geth:latest
 
-COPY entrypoint.sh /entrypoint.sh
+# RUN apk add --no-cache jq
+
+COPY entrypoint_l2.sh /entrypoint.sh
 
 VOLUME ["/db"]
 
